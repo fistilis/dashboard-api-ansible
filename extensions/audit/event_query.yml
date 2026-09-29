@@ -1,4 +1,47 @@
 ---
+# Indirect node counting queries for the cisco.meraki collection.
+#
+# These jq expressions run inside the Automation Platform controller
+# (awx/main/tasks/host_indirect.py) against each module's result, and their
+# output feeds subscription node counting. Nothing in this repository executes
+# them, so tests/unit/queries/test_event_query_contract.py asserts the
+# contract the controller imposes on the output.
+#
+# TWO RULES WHOSE COST IS THE WHOLE JOB
+# -------------------------------------
+# Most contract violations lose one node. These two lose every audit record
+# for the job, including the modules that were correct -- and the job stays
+# green while it happens.
+#
+# 1. EVERY TOP-LEVEL OUTPUT MUST BE AN OBJECT, NOT A LIST.
+#    _process_jq_result calls data.get('canonical_facts') on each element of
+#    compiled_jq.input(res).all(). A query that collects its records --
+#    `[ ... ]`, `map(...)`, or an `else []` branch -- emits a single list, and
+#    list.get raises AttributeError. _execute_jq_query does not catch it; it
+#    wraps only the jq call itself, so the exception escapes
+#    build_indirect_host_data and takes the job's whole transaction with it.
+#
+#    So: emit a stream. `.xs[] | {...}`, not `.xs | map({...})`; and
+#    `else empty end`, not `else [] end`. The empty branch matters most: it is
+#    the one every module takes when the task did not return a
+#    meraki_response, which is most tasks in most jobs.
+#
+# 2. `name` MUST BE UNIQUE WITHIN A JOB, SO IT IS AN IDENTIFIER.
+#    IndirectManagedNodeAudit declares unique_together = [('name', 'job')] and
+#    the controller bulk_create()s a job's records in one transaction. Two
+#    records that deduplicate apart on canonical_facts but share a `name`
+#    raise IntegrityError, which rolls back the transaction and reverts
+#    event_queries_processed with it -- so the fallback task re-picks the job
+#    and fails identically until it ages out.
+#
+#    This is the rule that opposes the obvious instinct. A Meraki device name
+#    is a label an administrator types, and two switches called `switch`, or
+#    two unnamed devices, or two ACL rules with the same comment, are the
+#    ordinary case. Every query below therefore emits its identifier -- the
+#    serial, MAC, network id or composite key that canonical_facts already
+#    uses -- as `name`, and reports the administrator's label in facts.name,
+#    which carries no uniqueness constraint.
+#
 # getNetworkSwitchMtu - checked
 cisco.meraki.networks_switch_mtu_info:
   query: >-
@@ -6,7 +49,7 @@ cisco.meraki.networks_switch_mtu_info:
       .meraki_response |
       if .overrides and (.overrides | length > 0) then
         . as $parent |
-        [
+        (
           $parent.overrides[] |
           . as $override |
           # Create entries for each switch serial
@@ -25,11 +68,10 @@ cisco.meraki.networks_switch_mtu_info:
               default_mtu_size: $parent.defaultMtuSize
             }
           }
-        ]
-      else
-        []
+        )
+      else empty
       end
-    else []
+    else empty
     end
 
 # Devices
@@ -37,8 +79,8 @@ cisco.meraki.devices_info:
   query: >-
     if .meraki_response then
       .meraki_response | [.] | flatten |
-      map(select(.serial != null) | {
-        name: ((.name | select(. != "")) // (.productType + "-" + .serial)),
+      .[] | (select(.serial != null) | {
+        name: .serial,
         canonical_facts: {
           ansible_product_serial: .serial
         },
@@ -50,10 +92,11 @@ cisco.meraki.devices_info:
           ansible_hostname: (.lanIp // ""),
           ansible_product_name: .model,
           ansible_bios_version: .firmware,
-          macaddress: .mac
+          macaddress: .mac,
+          name: ((.name | select(. != "")) // (.productType + "-" + .serial))
         }
       })
-    else []
+    else empty
     end
 
 # getDeviceSwitchPort
@@ -61,8 +104,8 @@ cisco.meraki.devices_switch_ports_info:
   query: >-
     if .meraki_response then
       [.meraki_response] |
-      map(select(.module.serial != null) | {
-        name: (.name // ("port-" + (.portId | tostring))),
+      .[] | (select(.module.serial != null) | {
+        name: .module.serial,
         canonical_facts: {
           ansible_product_serial: .module.serial
         },
@@ -72,9 +115,10 @@ cisco.meraki.devices_switch_ports_info:
           device_type: "switch",
           port_id: .portId,
           vlan_id: .vlan,
+          name: (.name // ("port-" + (.portId | tostring)))
         }
       })
-    else []
+    else empty
     end
 
 # getNetworkSwitchStack
@@ -83,7 +127,7 @@ cisco.meraki.networks_switch_stacks_info:
     if .meraki_response then
       .meraki_response |
       . as $parent |
-      [
+      (
         # Create entries for each switch serial in the stack
         ($parent.serials // [])[] |
         select(. != null) |
@@ -102,8 +146,8 @@ cisco.meraki.networks_switch_stacks_info:
             is_monitor_only: $parent.isMonitorOnly
           }
         }
-      ]
-    else []
+      )
+    else empty
     end
 
 # getNetworkSwitchStackRoutingInterfaces
@@ -111,8 +155,8 @@ cisco.meraki.networks_switch_stacks_routing_interfaces_info:
   query: >-
     if .meraki_response then
       (.meraki_response | if type == "array" then . else [.] end) |
-      map(select(.serial != null) | {
-        name: (.name // .serial),
+      .[] | (select(.serial != null) | {
+        name: .serial,
         canonical_facts: {
           ansible_product_serial: .serial
         },
@@ -126,9 +170,10 @@ cisco.meraki.networks_switch_stacks_routing_interfaces_info:
             ipv4_enabled: .uplinkV4,
             ipv6_enabled: .uplinkV6
           },
+          name: (.name // .serial)
         }
       })
-    else []
+    else empty
     end
 
 # updateDeviceSwitchPort
@@ -136,8 +181,8 @@ cisco.meraki.devices_switch_ports:
   query: >-
     if .meraki_response then
       [.meraki_response] |
-      map(select(.module.serial != null) | {
-        name: (.name // ("port-" + (.portId | tostring))),
+      .[] | (select(.module.serial != null) | {
+        name: .module.serial,
         canonical_facts: {
           ansible_product_serial: .module.serial
         },
@@ -150,10 +195,11 @@ cisco.meraki.devices_switch_ports:
             model: .module.model,
             serial: .module.serial,
             slot: .module.slot
-          }
+          },
+          name: (.name // ("port-" + (.portId | tostring)))
         }
       })
-    else []
+    else empty
     end
 
 # getOrganizationSwitchPortsBySwitch
@@ -161,8 +207,8 @@ cisco.meraki.organizations_switch_ports_by_switch_info:
   query: >-
     if .meraki_response then
       (.meraki_response | if type == "array" then . else [.] end) |
-      map(select(.serial != null) | {
-        name: (.name // .serial),
+      .[] | (select(.serial != null) | {
+        name: .serial,
         canonical_facts: {
           ansible_product_serial: .serial
         },
@@ -177,9 +223,10 @@ cisco.meraki.organizations_switch_ports_by_switch_info:
             network_name: .network.name,
             network_id: .network.id
           },
+          name: (.name // .serial)
         }
       })
-    else []
+    else empty
     end
 
 # getDeviceSwitchPortsStatuses
@@ -187,8 +234,8 @@ cisco.meraki.devices_switch_ports_statuses_info:
   query: >-
     if .meraki_response then
       (.meraki_response.items | if type == "array" then . else [.] end) |
-      map(select(.serial != null) | {
-        name: (.name // .serial),
+      .[] | (select(.serial != null) | {
+        name: .serial,
         canonical_facts: {
           ansible_product_serial: .serial
         },
@@ -203,9 +250,10 @@ cisco.meraki.devices_switch_ports_statuses_info:
             network_name: .network.name,
             network_id: .network.id
           },
+          name: (.name // .serial)
         }
       })
-    else []
+    else empty
     end
 
 # getNetworkSwitchAccessPolicies
@@ -213,8 +261,8 @@ cisco.meraki.networks_switch_access_policies_info:
   query: >-
     if .meraki_response then
       (.meraki_response | if type == "array" then . else [.] end) |
-      map(select(.accessPolicyNumber != null) | {
-        name: (.name // ("access-policy-" + (.accessPolicyNumber | tostring))),
+      .[] | (select(.accessPolicyNumber != null) | {
+        name: (.accessPolicyNumber | tostring),
         canonical_facts: {
           ansible_machine_id: (.accessPolicyNumber | tostring)
         },
@@ -224,9 +272,10 @@ cisco.meraki.networks_switch_access_policies_info:
           device_type: "switch",
           access_policy_number: .accessPolicyNumber,
           access_policy_type: .accessPolicyType,
+          name: (.name // ("access-policy-" + (.accessPolicyNumber | tostring)))
         }
       })
-    else []
+    else empty
     end
 
 # getNetworkSwitchSettings
@@ -236,7 +285,7 @@ cisco.meraki.networks_switch_settings_info:
       .meraki_response |
       if .powerExceptions and (.powerExceptions | length > 0) then
         . as $parent |
-        [
+        (
           $parent.powerExceptions[] |
           select(.serial != null) |
           {
@@ -257,11 +306,10 @@ cisco.meraki.networks_switch_settings_info:
               }
             }
           }
-        ]
-      else
-        []
+        )
+      else empty
       end
-    else []
+    else empty
     end
 
 # updateNetworkSwitchAccessPolicy
@@ -269,8 +317,8 @@ cisco.meraki.networks_switch_access_policies:
   query: >-
     if .meraki_response then
       (.meraki_response | if type == "array" then . else [.] end) |
-      map(select(.accessPolicyNumber != null) | {
-        name: (.name // ("access-policy-" + (.accessPolicyNumber | tostring))),
+      .[] | (select(.accessPolicyNumber != null) | {
+        name: (.accessPolicyNumber | tostring),
         canonical_facts: {
           ansible_machine_id: (.accessPolicyNumber | tostring)
         },
@@ -280,9 +328,10 @@ cisco.meraki.networks_switch_access_policies:
           device_type: "switch",
           access_policy_number: .accessPolicyNumber,
           access_policy_type: .accessPolicyType,
+          name: (.name // ("access-policy-" + (.accessPolicyNumber | tostring)))
         }
       })
-    else []
+    else empty
     end
 
 # createNetworkSwitchStackRoutingInterface
@@ -290,8 +339,8 @@ cisco.meraki.networks_switch_stacks_routing_interfaces:
   query: >-
     if .meraki_response then
       (.meraki_response | if type == "array" then . else [.] end) |
-      map(select(.serial != null) | {
-        name: (.name // .serial),
+      .[] | (select(.serial != null) | {
+        name: .serial,
         canonical_facts: {
           ansible_product_serial: .serial
         },
@@ -303,9 +352,10 @@ cisco.meraki.networks_switch_stacks_routing_interfaces:
           interface_id: .interfaceId,
           vlan_id: .vlanId,
           interface_ip: .interfaceIp,
+          name: (.name // .serial)
         }
       })
-    else []
+    else empty
     end
 
 # getNetworkSwitchStp
@@ -315,7 +365,7 @@ cisco.meraki.networks_switch_stp_info:
       .meraki_response |
       if .stpBridgePriority and (.stpBridgePriority | length > 0) then
         . as $parent |
-        [
+        (
           $parent.stpBridgePriority[] |
           . as $priority_config |
           (
@@ -336,11 +386,10 @@ cisco.meraki.networks_switch_stp_info:
               }
             }
           )
-        ] | flatten
-      else
-        []
+        )
+      else empty
       end
-    else []
+    else empty
     end
 
 # createNetworkSwitchQosRule / updateNetworkSwitchQosRule / deleteNetworkSwitchQosRule
@@ -348,8 +397,8 @@ cisco.meraki.networks_switch_qos_rules_order:
   query: >-
     if .meraki_response then
       (.meraki_response | if type == "array" then . else [.] end) |
-      map(select(.id != null) | {
-        name: ("qos-rule-" + (.id | tostring)),
+      .[] | (select(.id != null) | {
+        name: (.id | tostring),
         canonical_facts: {
           ansible_machine_id: (.id | tostring)
         },
@@ -366,10 +415,11 @@ cisco.meraki.networks_switch_qos_rules_order:
             dst_port: .dstPort,
             dst_port_range: .dstPortRange,
             dscp: .dscp
-          }
+          },
+          name: ("qos-rule-" + (.id | tostring))
         }
       })
-    else []
+    else empty
     end
 
 # cycleDeviceSwitchPorts
@@ -377,8 +427,8 @@ cisco.meraki.devices_switch_ports_cycle:
   query: >-
     if .meraki_response then
       (.meraki_response.ports // []) |
-      map(select(. != null) | {
-        name: ("port-" + .),
+      .[] | (select(. != null) | {
+        name: .,
         canonical_facts: {
           ansible_machine_id: .
         },
@@ -386,10 +436,11 @@ cisco.meraki.devices_switch_ports_cycle:
           infra_type: "private_cloud",
           infra_bucket: "networking",
           device_type: "switch",
-          port_identifier: .
+          port_identifier: .,
+          name: ("port-" + .)
         }
       })
-    else []
+    else empty
     end
 
 # getNetworkSwitchAccessControlLists - not good
@@ -398,8 +449,11 @@ cisco.meraki.networks_switch_access_control_lists_info:
     if .meraki_response then
       (.meraki_response.rules // []) |
       to_entries |
-      map(select(.key != null) | {
-        name: (.value.comment // ("acl-rule-" + (.key | tostring))),
+      .[] | (select(.key != null) | {
+        name: (
+          (.value.dstCidr // "") + "-" +
+          (.key | tostring)
+        ),
         canonical_facts: {
           ansible_machine_id: (
             (.value.dstCidr // "") + "-" +
@@ -421,10 +475,11 @@ cisco.meraki.networks_switch_access_control_lists_info:
             dst_port: .value.dstPort,
             vlan: .value.vlan,
             rule_index: .key
-          }
+          },
+          name: (.value.comment // ("acl-rule-" + (.key | tostring)))
         }
       })
-    else []
+    else empty
     end
 
 # createNetworkSwitchStack / deleteNetworkSwitchStack
@@ -433,7 +488,7 @@ cisco.meraki.networks_switch_stacks:
     if .meraki_response then
       .meraki_response |
       . as $parent |
-      [
+      (
         # Create entries for each switch serial in the stack
         ($parent.serials // [])[] |
         select(. != null) |
@@ -451,8 +506,8 @@ cisco.meraki.networks_switch_stacks:
             workflow_id: ($parent.workflowId | tostring)
           }
         }
-      ]
-    else []
+      )
+    else empty
     end
 
 # updateNetworkSwitchSettings
@@ -461,7 +516,7 @@ cisco.meraki.networks_switch_settings:
     if .meraki_response then
       .meraki_response |
       . as $parent |
-      [
+      (
         # Create entries for each switch with power exceptions
         ($parent.powerExceptions // [])[] |
         select(.serial != null) |
@@ -483,8 +538,8 @@ cisco.meraki.networks_switch_settings:
             }
           }
         }
-      ]
-    else []
+      )
+    else empty
     end
 
 # getNetworkSwitchStackRoutingInterfaceDhcp
@@ -493,12 +548,12 @@ cisco.meraki.networks_switch_stacks_routing_interfaces_dhcp_info:
     if .meraki_response then
       .meraki_response |
       . as $parent |
-      [
+      (
         # Create entries for each device with fixed IP assignment
         ($parent.fixedIpAssignments // [])[] |
         select(.mac != null) |
         {
-          name: (.name // .mac),
+          name: .mac,
           canonical_facts: {
             ansible_machine_id: .mac
           },
@@ -512,10 +567,11 @@ cisco.meraki.networks_switch_stacks_routing_interfaces_dhcp_info:
               ip: .ip,
               name: .name
             },
+            name: (.name // .mac)
           }
         }
-      ]
-    else []
+      )
+    else empty
     end
 
 # updateNetworkSwitchStackRoutingInterfaceDhcp
@@ -524,12 +580,12 @@ cisco.meraki.networks_switch_stacks_routing_interfaces_dhcp:
     if .meraki_response then
       .meraki_response |
       . as $parent |
-      [
+      (
         # Create entries for each device with fixed IP assignment
         ($parent.fixedIpAssignments // [])[] |
         select(.mac != null) |
         {
-          name: (.name // .mac),
+          name: .mac,
           canonical_facts: {
             ansible_machine_id: .mac
           },
@@ -548,11 +604,12 @@ cisco.meraki.networks_switch_stacks_routing_interfaces_dhcp:
               dhcp_lease_time: $parent.dhcpLeaseTime,
               dns_nameservers_option: $parent.dnsNameserversOption,
               boot_options_enabled: $parent.bootOptionsEnabled
-            }
+            },
+            name: (.name // .mac)
           }
         }
-      ]
-    else []
+      )
+    else empty
     end
 
 # getNetworkSwitchDhcpServerPolicy
@@ -561,13 +618,13 @@ cisco.meraki.networks_switch_dhcp_server_policy_info:
     if .meraki_response then
       .meraki_response |
       . as $parent |
-      [
+      (
         (
           # Create entries for each blocked DHCP server
           ($parent.blockedServers // [])[] |
           select(. != null) |
           {
-            name: ("blocked-dhcp-server-" + .),
+            name: .,
             canonical_facts: {
               ansible_machine_id: .
             },
@@ -580,7 +637,8 @@ cisco.meraki.networks_switch_dhcp_server_policy_info:
                 mac_address: .,
                 default_policy: $parent.defaultPolicy,
                 arp_inspection_enabled: ($parent.arpInspection.enabled // false)
-              }
+              },
+              name: ("blocked-dhcp-server-" + .)
             }
           }
         ),
@@ -589,7 +647,7 @@ cisco.meraki.networks_switch_dhcp_server_policy_info:
           ($parent.allowedServers // [])[] |
           select(. != null) |
           {
-            name: ("allowed-dhcp-server-" + .),
+            name: .,
             canonical_facts: {
               ansible_machine_id: .
             },
@@ -602,12 +660,13 @@ cisco.meraki.networks_switch_dhcp_server_policy_info:
                 mac_address: .,
                 default_policy: $parent.defaultPolicy,
                 arp_inspection_enabled: ($parent.arpInspection.enabled // false)
-              }
+              },
+              name: ("allowed-dhcp-server-" + .)
             }
           }
         )
-      ]
-    else []
+      )
+    else empty
     end
 
 # updateNetworkSwitchStp
@@ -617,7 +676,7 @@ cisco.meraki.networks_switch_stp:
       .meraki_response |
       if .stpBridgePriority and (.stpBridgePriority | length > 0) then
         . as $parent |
-        [
+        (
           $parent.stpBridgePriority[] |
           . as $priority_config |
           (
@@ -638,11 +697,10 @@ cisco.meraki.networks_switch_stp:
               }
             }
           )
-        ] | flatten
-      else
-        []
+        )
+      else empty
       end
-    else []
+    else empty
     end
 
 # createNetworkSwitchLinkAggregation / updateNetworkSwitchLinkAggregation / deleteNetworkSwitchLinkAggregation
@@ -651,12 +709,12 @@ cisco.meraki.networks_switch_link_aggregations:
     if .meraki_response then
       .meraki_response |
       . as $parent |
-      [
+      (
         # Create entries for each port in the link aggregation
         ($parent.switchPorts // [])[] |
         select(.serial != null) |
         {
-          name: (.serial + "-port-" + (.portId | tostring)),
+          name: .serial,
           canonical_facts: {
             ansible_product_serial: .serial
           },
@@ -668,11 +726,12 @@ cisco.meraki.networks_switch_link_aggregations:
               aggregation_id: ($parent.id | tostring),
               port_id: (.portId | tostring),
               serial: .serial
-            }
+            },
+            name: (.serial + "-port-" + (.portId | tostring))
           }
         }
-      ]
-    else []
+      )
+    else empty
     end
 
 # getDeviceSwitchRoutingInterfaces / getDeviceSwitchRoutingInterface
@@ -680,8 +739,8 @@ cisco.meraki.devices_switch_routing_interfaces_info:
   query: >-
     if .meraki_response then
       (.meraki_response | if type == "array" then . else [.] end) |
-      map(select(.serial != null) | {
-        name: (.name // ("interface-" + (.interfaceId | tostring))),
+      .[] | (select(.serial != null) | {
+        name: .serial,
         canonical_facts: {
           ansible_product_serial: .serial
         },
@@ -701,10 +760,11 @@ cisco.meraki.devices_switch_routing_interfaces_info:
             else
               {}
             end
-          )
+          ),
+          name: (.name // ("interface-" + (.interfaceId | tostring)))
         }
       })
-    else []
+    else empty
     end
 
 # createDeviceSwitchRoutingInterface / updateDeviceSwitchRoutingInterface / deleteDeviceSwitchRoutingInterface
@@ -712,8 +772,8 @@ cisco.meraki.devices_switch_routing_interfaces:
   query: >-
     if .meraki_response then
       [.meraki_response] |
-      map(select(.serial != null) | {
-        name: (.name // ("interface-" + (.interfaceId | tostring))),
+      .[] | (select(.serial != null) | {
+        name: .serial,
         canonical_facts: {
           ansible_product_serial: .serial
         },
@@ -733,10 +793,11 @@ cisco.meraki.devices_switch_routing_interfaces:
             else
               {}
             end
-          )
+          ),
+          name: (.name // ("interface-" + (.interfaceId | tostring)))
         }
       })
-    else []
+    else empty
     end
 
 # updateNetworkSwitchAccessControlLists - no good
@@ -745,8 +806,12 @@ cisco.meraki.networks_switch_access_control_lists:
     if .meraki_response then
       (.meraki_response.rules // []) |
       to_entries |
-      map(select(.key != null) | {
-        name: (.value.comment // ("acl-rule-" + (.key | tostring))),
+      .[] | (select(.key != null) | {
+        name: (
+          (.value.srcCidr // "") + "-" +
+          (.value.dstCidr // "") + "-" +
+          (.key | tostring)
+        ),
         canonical_facts: {
           ansible_machine_id: (
             (.value.srcCidr // "") + "-" +
@@ -769,10 +834,11 @@ cisco.meraki.networks_switch_access_control_lists:
             dst_port: .value.dstPort,
             vlan: .value.vlan,
             rule_index: .key
-          }
+          },
+          name: (.value.comment // ("acl-rule-" + (.key | tostring)))
         }
       })
-    else []
+    else empty
     end
 
 # getNetworkSwitchRoutingMulticast
@@ -782,7 +848,7 @@ cisco.meraki.networks_switch_routing_multicast_info:
       .meraki_response |
       if .overrides and (.overrides | length > 0) then
         . as $parent |
-        [
+        (
           $parent.overrides[] |
           . as $override |
           (
@@ -809,11 +875,10 @@ cisco.meraki.networks_switch_routing_multicast_info:
               }
             }
           )
-        ] | flatten
-      else
-        []
+        )
+      else empty
       end
-    else []
+    else empty
     end
 
 # getNetworkSwitchRoutingOspf - not good
@@ -822,13 +887,13 @@ cisco.meraki.networks_switch_routing_ospf_info:
     if .meraki_response then
       .meraki_response |
       . as $parent |
-      [
+      (
         (
           # Create entries for each OSPFv2 area
           ($parent.areas // [])[] |
           select(.areaId != null) |
           {
-            name: (.areaName // ("ospf-area-" + (.areaId | tostring))),
+            name: (.areaId | tostring),
             canonical_facts: {
               ansible_machine_id: (.areaId | tostring)
             },
@@ -856,7 +921,8 @@ cisco.meraki.networks_switch_routing_ospf_info:
                 else
                   {}
                 end
-              )
+              ),
+              name: (.areaName // ("ospf-area-" + (.areaId | tostring)))
             }
           }
         ),
@@ -865,7 +931,7 @@ cisco.meraki.networks_switch_routing_ospf_info:
           (($parent.v3 // {}).areas // [])[] |
           select(.areaId != null) |
           {
-            name: (.areaName // ("ospfv3-area-" + (.areaId | tostring))),
+            name: ("v3-" + (.areaId | tostring)),
             canonical_facts: {
               ansible_machine_id: ("v3-" + (.areaId | tostring))
             },
@@ -892,12 +958,13 @@ cisco.meraki.networks_switch_routing_ospf_info:
                 else
                   {}
                 end
-              )
+              ),
+              name: (.areaName // ("ospfv3-area-" + (.areaId | tostring)))
             }
           }
         )
-      ]
-    else []
+      )
+    else empty
     end
 
 # getNetworkSwitchAlternateManagementInterface
@@ -906,7 +973,7 @@ cisco.meraki.networks_switch_alternate_management_interface_info:
     if .meraki_response then
       .meraki_response |
       . as $parent |
-      [
+      (
         # Create entries for each switch with alternate management interface
         ($parent.switches // [])[] |
         select(.serial != null) |
@@ -930,8 +997,8 @@ cisco.meraki.networks_switch_alternate_management_interface_info:
             }
           }
         }
-      ]
-    else []
+      )
+    else empty
     end
 
 # getOrganizationConfigTemplateSwitchProfiles
@@ -939,8 +1006,8 @@ cisco.meraki.organizations_config_templates_switch_profiles_info:
   query: >-
     if .meraki_response then
       (.meraki_response | if type == "array" then . else [.] end) |
-      map(select(.switchProfileId != null) | {
-        name: (.name // ("switch-profile-" + (.switchProfileId | tostring))),
+      .[] | (select(.switchProfileId != null) | {
+        name: (.switchProfileId | tostring),
         canonical_facts: {
           ansible_machine_id: (.switchProfileId | tostring)
         },
@@ -952,10 +1019,11 @@ cisco.meraki.organizations_config_templates_switch_profiles_info:
             profile_id: (.switchProfileId | tostring),
             name: .name,
             model: .model
-          }
+          },
+          name: (.name // ("switch-profile-" + (.switchProfileId | tostring)))
         }
       })
-    else []
+    else empty
     end
 
 # updateNetworkSwitchRoutingOspf - not good
@@ -964,13 +1032,13 @@ cisco.meraki.networks_switch_routing_ospf:
     if .meraki_response then
       .meraki_response |
       . as $parent |
-      [
+      (
         (
           # Create entries for each OSPFv2 area
           ($parent.areas // [])[] |
           select(.areaId != null) |
           {
-            name: (.areaName // ("ospf-area-" + (.areaId | tostring))),
+            name: (.areaId | tostring),
             canonical_facts: {
               ansible_machine_id: (.areaId | tostring)
             },
@@ -998,7 +1066,8 @@ cisco.meraki.networks_switch_routing_ospf:
                 else
                   {}
                 end
-              )
+              ),
+              name: (.areaName // ("ospf-area-" + (.areaId | tostring)))
             }
           }
         ),
@@ -1007,7 +1076,7 @@ cisco.meraki.networks_switch_routing_ospf:
           (($parent.v3 // {}).areas // [])[] |
           select(.areaId != null) |
           {
-            name: (.areaName // ("ospfv3-area-" + (.areaId | tostring))),
+            name: ("v3-" + (.areaId | tostring)),
             canonical_facts: {
               ansible_machine_id: ("v3-" + (.areaId | tostring))
             },
@@ -1034,12 +1103,13 @@ cisco.meraki.networks_switch_routing_ospf:
                 else
                   {}
                 end
-              )
+              ),
+              name: (.areaName // ("ospfv3-area-" + (.areaId | tostring)))
             }
           }
         )
-      ]
-    else []
+      )
+    else empty
     end
 
 # getNetworkSwitchDhcpServerPolicyArpInspectionTrustedServers
@@ -1047,8 +1117,8 @@ cisco.meraki.networks_switch_dhcp_server_policy_arp_inspection_trusted_servers_i
   query: >-
     if .meraki_response then
       (.meraki_response | if type == "array" then . else [.] end) |
-      map(select(.mac != null) | {
-        name: ("trusted-server-" + (.trustedServerId | tostring)),
+      .[] | (select(.mac != null) | {
+        name: .mac,
         canonical_facts: {
           ansible_machine_id: .mac
         },
@@ -1062,10 +1132,11 @@ cisco.meraki.networks_switch_dhcp_server_policy_arp_inspection_trusted_servers_i
             mac_address: .mac,
             vlan: .vlan,
             ipv4_address: (.ipv4.address // "")
-          }
+          },
+          name: ("trusted-server-" + (.trustedServerId | tostring))
         }
       })
-    else []
+    else empty
     end
 
 # getNetworkSwitchDhcpServerPolicyArpInspectionWarningsByDevice
@@ -1073,8 +1144,8 @@ cisco.meraki.networks_switch_dhcp_server_policy_arp_inspection_warnings_by_devic
   query: >-
     if .meraki_response then
       (.meraki_response | if type == "array" then . else [.] end) |
-      map(select(.serial != null) | {
-        name: (.name // .serial),
+      .[] | (select(.serial != null) | {
+        name: .serial,
         canonical_facts: {
           ansible_product_serial: .serial
         },
@@ -1086,10 +1157,11 @@ cisco.meraki.networks_switch_dhcp_server_policy_arp_inspection_warnings_by_devic
             supports_inspection: .supportsInspection,
             has_trusted_port: .hasTrustedPort,
             url: .url
-          }
+          },
+          name: (.name // .serial)
         }
       })
-    else []
+    else empty
     end
 
 # getNetworkSwitchDhcpV4ServersSeen
@@ -1097,7 +1169,7 @@ cisco.meraki.networks_switch_dhcp_v4_servers_seen_info:
   query: >-
     if .meraki_response then
       (.meraki_response | if type == "array" then . else [.] end) |
-      [
+      (
         .[] |
         . as $dhcp_server |
         (
@@ -1155,8 +1227,8 @@ cisco.meraki.networks_switch_dhcp_v4_servers_seen_info:
             }
           }
         )
-      ] | flatten
-    else []
+      )
+    else empty
     end
 
 # getNetworkSwitchLinkAggregations
@@ -1164,13 +1236,13 @@ cisco.meraki.networks_switch_link_aggregations_info:
   query: >-
     if .meraki_response then
       (.meraki_response | if type == "array" then . else [.] end) |
-      [
+      (
         .[] |
         . as $aggregation |
         ($aggregation.switchPorts // [])[] |
         select(.serial != null) |
         {
-          name: (.serial + "-port-" + (.portId | tostring)),
+          name: .serial,
           canonical_facts: {
             ansible_product_serial: .serial
           },
@@ -1182,11 +1254,12 @@ cisco.meraki.networks_switch_link_aggregations_info:
               aggregation_id: ($aggregation.id | tostring),
               port_id: (.portId | tostring),
               serial: .serial
-            }
+            },
+            name: (.serial + "-port-" + (.portId | tostring))
           }
         }
-      ]
-    else []
+      )
+    else empty
     end
 
 # getNetworkSwitchQosRules / getNetworkSwitchQosRule
@@ -1194,8 +1267,8 @@ cisco.meraki.networks_switch_qos_rules_order_info:
   query: >-
     if .meraki_response then
       (.meraki_response | if type == "array" then . else [.] end) |
-      map(select(.id != null) | {
-        name: ("qos-rule-" + (.id | tostring)),
+      .[] | (select(.id != null) | {
+        name: (.id | tostring),
         canonical_facts: {
           ansible_machine_id: (.id | tostring)
         },
@@ -1212,10 +1285,11 @@ cisco.meraki.networks_switch_qos_rules_order_info:
             dst_port: .dstPort,
             dst_port_range: .dstPortRange,
             dscp: .dscp
-          }
+          },
+          name: ("qos-rule-" + (.id | tostring))
         }
       })
-    else []
+    else empty
     end
 
 # getNetworkSwitchRoutingMulticastRendezvousPoints / getNetworkSwitchRoutingMulticastRendezvousPoint
@@ -1223,8 +1297,8 @@ cisco.meraki.networks_switch_routing_multicast_rendezvous_points_info:
   query: >-
     if .meraki_response then
       (.meraki_response | if type == "array" then . else [.] end) |
-      map(select(.serial != null) | {
-        name: ("rendezvous-point-" + (.rendezvousPointId | tostring)),
+      .[] | (select(.serial != null) | {
+        name: .serial,
         canonical_facts: {
           ansible_product_serial: .serial
         },
@@ -1239,10 +1313,11 @@ cisco.meraki.networks_switch_routing_multicast_rendezvous_points_info:
             interface_name: .interfaceName,
             interface_ip: .interfaceIp,
             multicast_group: .multicastGroup
-          }
+          },
+          name: ("rendezvous-point-" + (.rendezvousPointId | tostring))
         }
       })
-    else []
+    else empty
     end
 
 # getDeviceSwitchRoutingStaticRoutes / getDeviceSwitchRoutingStaticRoute - not good
@@ -1250,8 +1325,8 @@ cisco.meraki.devices_switch_routing_static_routes_info:
   query: >-
     if .meraki_response then
       (.meraki_response | if type == "array" then . else [.] end) |
-      map(select(.staticRouteId != null) | {
-        name: (.name // ("static-route-" + (.staticRouteId | tostring))),
+      .[] | (select(.staticRouteId != null) | {
+        name: (.staticRouteId | tostring),
         canonical_facts: {
           ansible_machine_id: (.staticRouteId | tostring)
         },
@@ -1277,10 +1352,11 @@ cisco.meraki.devices_switch_routing_static_routes_info:
                 {}
               end
             )
-          }
+          },
+          name: (.name // ("static-route-" + (.staticRouteId | tostring)))
         }
       })
-    else []
+    else empty
     end
 
 # removeNetworkSwitchStack
@@ -1289,7 +1365,7 @@ cisco.meraki.networks_switch_stacks_remove:
     if .meraki_response then
       .meraki_response |
       . as $parent |
-      [
+      (
         # Create entries for each switch serial in the stack
         ($parent.serials // [])[] |
         select(. != null) |
@@ -1308,8 +1384,8 @@ cisco.meraki.networks_switch_stacks_remove:
             virtual_mac: $parent.virtualMac
           }
         }
-      ]
-    else []
+      )
+    else empty
     end
 
 # getDeviceSwitchWarmSpare
@@ -1319,7 +1395,7 @@ cisco.meraki.devices_switch_warm_spare_info:
       .meraki_response |
       if .enabled then
         . as $parent |
-        [
+        (
           # Create entry for primary switch
           # NOTE: `,` binds tighter than `|` in jq, so each element of this
           # array has to be parenthesised or the guard would apply to the
@@ -1363,11 +1439,10 @@ cisco.meraki.devices_switch_warm_spare_info:
             }
           }
           )
-        ]
-      else
-        []
+        )
+      else empty
       end
-    else []
+    else empty
     end
 
 # getOrganizationSummaryTopSwitchesByEnergyUsage - not good
@@ -1375,8 +1450,8 @@ cisco.meraki.organizations_summary_top_switches_by_energy_usage_info:
   query: >-
     if .meraki_response then
       (.meraki_response | if type == "array" then . else [.] end) |
-      map(select(.mac != null) | {
-        name: (.name // .mac),
+      .[] | (select(.mac != null) | {
+        name: .mac,
         canonical_facts: {
           ansible_machine_id: .mac
         },
@@ -1401,10 +1476,11 @@ cisco.meraki.organizations_summary_top_switches_by_energy_usage_info:
           ),
           energy_usage: {
             total: .usage.total
-          }
+          },
+          name: (.name // .mac)
         }
       })
-    else []
+    else empty
     end
 
 # addNetworkSwitchStack
@@ -1413,7 +1489,7 @@ cisco.meraki.networks_switch_stacks_add:
     if .meraki_response then
       .meraki_response |
       . as $parent |
-      [
+      (
         # Create entries for each switch serial in the stack
         ($parent.serials // [])[] |
         select(. != null) |
@@ -1432,8 +1508,8 @@ cisco.meraki.networks_switch_stacks_add:
             virtual_mac: $parent.virtualMac
           }
         }
-      ]
-    else []
+      )
+    else empty
     end
 
 # getDeviceSwitchRoutingInterfaceDhcp - not good
@@ -1442,12 +1518,12 @@ cisco.meraki.devices_switch_routing_interfaces_dhcp_info:
     if .meraki_response then
       .meraki_response |
       . as $parent |
-      [
+      (
         # Create entries for each device with fixed IP assignment
         ($parent.fixedIpAssignments // [])[] |
         select(.mac != null) |
         {
-          name: (.name // .mac),
+          name: .mac,
           canonical_facts: {
             ansible_machine_id: .mac
           },
@@ -1466,11 +1542,12 @@ cisco.meraki.devices_switch_routing_interfaces_dhcp_info:
               dhcp_lease_time: $parent.dhcpLeaseTime,
               dns_nameservers_option: $parent.dnsNameserversOption,
               boot_options_enabled: $parent.bootOptionsEnabled
-            }
+            },
+            name: (.name // .mac)
           }
         }
-      ]
-    else []
+      )
+    else empty
     end
 
 # getDeviceSwitchRoutingInterfaceDhcp
@@ -1479,12 +1556,12 @@ cisco.meraki.devices_switch_routing_interfaces_dhcp:
     if .meraki_response then
       .meraki_response |
       . as $parent |
-      [
+      (
         # Create entries for each device with fixed IP assignment
         ($parent.fixedIpAssignments // [])[] |
         select(.mac != null) |
         {
-          name: (.name // .mac),
+          name: .mac,
           canonical_facts: {
             ansible_machine_id: .mac
           },
@@ -1503,11 +1580,12 @@ cisco.meraki.devices_switch_routing_interfaces_dhcp:
               dhcp_lease_time: $parent.dhcpLeaseTime,
               dns_nameservers_option: $parent.dnsNameserversOption,
               boot_options_enabled: $parent.bootOptionsEnabled
-            }
+            },
+            name: (.name // .mac)
           }
         }
-      ]
-    else []
+      )
+    else empty
     end
 
 # updateNetworkSwitchRoutingMulticast
@@ -1517,7 +1595,7 @@ cisco.meraki.networks_switch_routing_multicast:
       .meraki_response |
       if .overrides and (.overrides | length > 0) then
         . as $parent |
-        [
+        (
           $parent.overrides[] |
           . as $override |
           (
@@ -1544,11 +1622,10 @@ cisco.meraki.networks_switch_routing_multicast:
               }
             }
           )
-        ] | flatten
-      else
-        []
+        )
+      else empty
       end
-    else []
+    else empty
     end
 
 # updateNetworkSwitchDhcpServerPolicy
@@ -1557,13 +1634,13 @@ cisco.meraki.networks_switch_dhcp_server_policy:
     if .meraki_response then
       .meraki_response |
       . as $parent |
-      [
+      (
         (
           # Create entries for each blocked DHCP server
           ($parent.blockedServers // [])[] |
           select(. != null) |
           {
-            name: ("blocked-dhcp-server-" + .),
+            name: .,
             canonical_facts: {
               ansible_machine_id: .
             },
@@ -1576,7 +1653,8 @@ cisco.meraki.networks_switch_dhcp_server_policy:
                 mac_address: .,
                 default_policy: $parent.defaultPolicy,
                 arp_inspection_enabled: ($parent.arpInspection.enabled // false)
-              }
+              },
+              name: ("blocked-dhcp-server-" + .)
             }
           }
         ),
@@ -1585,7 +1663,7 @@ cisco.meraki.networks_switch_dhcp_server_policy:
           ($parent.allowedServers // [])[] |
           select(. != null) |
           {
-            name: ("allowed-dhcp-server-" + .),
+            name: .,
             canonical_facts: {
               ansible_machine_id: .
             },
@@ -1598,12 +1676,13 @@ cisco.meraki.networks_switch_dhcp_server_policy:
                 mac_address: .,
                 default_policy: $parent.defaultPolicy,
                 arp_inspection_enabled: ($parent.arpInspection.enabled // false)
-              }
+              },
+              name: ("allowed-dhcp-server-" + .)
             }
           }
         )
-      ]
-    else []
+      )
+    else empty
     end
 
 # Networks
@@ -1611,8 +1690,8 @@ cisco.meraki.networks_info:
   query: >-
     if .meraki_response then
       .meraki_response | [.] | flatten |
-      map(select(.id != null) | {
-        name: (.name // .id),
+      .[] | (select(.id != null) | {
+        name: .id,
         canonical_facts: {
           ansible_machine_id: .id
         },
@@ -1620,10 +1699,11 @@ cisco.meraki.networks_info:
           infra_type: "private_cloud",
           infra_bucket: "networking",
           device_type: "network",
-          meraki_organization_id: .organizationId
+          meraki_organization_id: .organizationId,
+          name: (.name // .id)
         }
       })
-    else []
+    else empty
     end
 
 # delete operation returns "meraki_response": null
@@ -1631,8 +1711,8 @@ cisco.meraki.networks:
   query: >-
     if .meraki_response then
       [.meraki_response] |
-      map(select(.id != null) | {
-        name: (.name // .id),
+      .[] | (select(.id != null) | {
+        name: .id,
         canonical_facts: {
           ansible_machine_id: .id
         },
@@ -1640,10 +1720,11 @@ cisco.meraki.networks:
           infra_type: "private_cloud",
           infra_bucket: "networking",
           device_type: "switch",
-          meraki_organization_id: .organizationId
+          meraki_organization_id: .organizationId,
+          name: (.name // .id)
         }
       })
-    else []
+    else empty
     end
 
 # updateDevice does not seem to return productType field
@@ -1651,8 +1732,8 @@ cisco.meraki.devices:
   query: >-
     if .meraki_response then
       .meraki_response | [.] | flatten |
-      map(select(.serial != null) | {
-        name: ((.name | select(. != "")) // (.model + "-" + .serial)),
+      .[] | (select(.serial != null) | {
+        name: .serial,
         canonical_facts: {
           ansible_product_serial: .serial
         },
@@ -1669,8 +1750,9 @@ cisco.meraki.devices:
           ansible_hostname: (.lanIp // ""),
           ansible_product_name: .model,
           ansible_bios_version: .firmware,
-          macaddress: .mac
+          macaddress: .mac,
+          name: ((.name | select(. != "")) // (.model + "-" + .serial))
         }
       })
-    else []
+    else empty
     end
