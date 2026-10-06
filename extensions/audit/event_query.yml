@@ -1686,46 +1686,21 @@ cisco.meraki.networks_switch_dhcp_server_policy:
     end
 
 # Networks
-cisco.meraki.networks_info:
-  query: >-
-    if .meraki_response then
-      .meraki_response | [.] | flatten |
-      .[] | (select(.id != null) | {
-        name: .id,
-        canonical_facts: {
-          ansible_machine_id: .id
-        },
-        facts: {
-          infra_type: "private_cloud",
-          infra_bucket: "networking",
-          device_type: "network",
-          meraki_organization_id: .organizationId,
-          name: (.name // .id)
-        }
-      })
-    else empty
-    end
-
-# delete operation returns "meraki_response": null
-cisco.meraki.networks:
-  query: >-
-    if .meraki_response then
-      [.meraki_response] |
-      .[] | (select(.id != null) | {
-        name: .id,
-        canonical_facts: {
-          ansible_machine_id: .id
-        },
-        facts: {
-          infra_type: "private_cloud",
-          infra_bucket: "networking",
-          device_type: "switch",
-          meraki_organization_id: .organizationId,
-          name: (.name // .id)
-        }
-      })
-    else empty
-    end
+#
+# cisco.meraki.networks and cisco.meraki.networks_info deliberately have no
+# audit query. A Meraki network is an administrative container, not a device,
+# so counting one reports infrastructure that does not exist. The taxonomy
+# article states this directly: "Do not emit audit records for organization-
+# or network-scoped modules. A Meraki network is an administrative container,
+# not a device; counting one inflates the node count."
+#
+# The switches, access points and appliances inside a network are reported by
+# the device-scoped modules, keyed on their serial numbers.
+#
+# Network-scoped modules whose *response* yields device serials are a separate
+# case and do keep their queries -- networks_switch_stacks_info reports one
+# record per member serial from .serials[]. The test is whether the response
+# identifies a device, not whether the endpoint is network-scoped.
 
 # updateDevice does not seem to return productType field
 cisco.meraki.devices:
